@@ -1,0 +1,39 @@
+name: swag-watch
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: swag-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check swag status
+        shell: bash
+        run: |
+          set -u
+          url="https://claude.dev/terminal/swag-status.json"
+          body=$(curl -fsS -m 20 --retry 3 --retry-delay 5 -A "Mozilla/5.0 swag-watch" "$url") || {
+            echo "读取失败，本次跳过（不算补货）"
+            exit 0
+          }
+          echo "返回内容: $body"
+          off=$(printf '%s' "$body" | jq -c '.off // empty' 2>/dev/null || true)
+          if [ -n "$off" ] \
+             && printf '%s' "$off" | jq -e 'type=="array" and index("plushie")!=null and index("stickers")!=null' >/dev/null; then
+            echo "仍已领完"
+            exit 0
+          fi
+          open=""
+          printf '%s' "$off" | jq -e 'type=="array" and index("plushie")!=null' >/dev/null 2>&1 || open="$open 毛绒玩具(plushie)"
+          printf '%s' "$off" | jq -e 'type=="array" and index("stickers")!=null' >/dev/null 2>&1 || open="$open 贴纸(stickers)"
+          echo "::error title=Claude 周边可能补货了::开放项目:${open}。立刻用手机打开 https://claude.dev/terminal/ 输入 /plushies 或 /stickers 登记"
+          exit 1
