@@ -1,43 +1,96 @@
-# Claude 周边补货监控：每5分钟检查一次，补货时任务失败并触发 GitHub 邮件通知 
+# Claude 周边补货监控：单次任务持续约 5 小时 50 分钟，每5分钟检查一次，结束前自动接力启动下一轮
+# 补货时在仓库开 issue 并 @Norah0708（GitHub 会发邮件），之后每30分钟追加一条提醒
 name: swag-watch
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "23 */3 * * *"
   workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "只发一条测试提醒，用来确认能收到邮件"
+        type: boolean
+        default: false
   push:
     paths:
       - .github/workflows/swag-watch.yml
 
-permissions: {}
+permissions:
+  actions: write
+  issues: write
 
 concurrency:
-  group: swag-watch
+  group: swag-watch-${{ inputs.test_alert && 'test' || 'main' }}
   cancel-in-progress: false
 
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  STATUS_URL: https://claude.dev/terminal/swag-status.json
+  ISSUE_TITLE: Claude 周边可能补货了
+  OWNER: Norah0708
+
 jobs:
-  check:
+  watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 358
     steps:
-      - name: Check swag status
+      - name: Watch swag status
+        id: watch
         shell: bash
         run: |
           set -u
-          url="https://claude.dev/terminal/swag-status.json"
-          body=$(curl -fsS -m 20 --retry 3 --retry-delay 5 -A "Mozilla/5.0 swag-watch" "$url") || {
-            echo "读取失败，本次跳过（不算补货）"
-            exit 0
+
+          alert() {
+            local open="$1"
+            local body="@${OWNER} Claude 周边可能补货了：${open}。立刻用手机打开 https://claude.dev/terminal/ 输入 /plushies 或 /stickers 登记。（检测时间 $(date -u '+%Y-%m-%d %H:%M UTC')）"
+            local num
+            num=$(gh issue list --state open --search "in:title ${ISSUE_TITLE}" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+            if [ -n "$num" ]; then
+              gh issue comment "$num" --body "$body" || echo "评论 issue 失败"
+            else
+              gh issue create --title "$ISSUE_TITLE" --body "$body" || echo "创建 issue 失败"
+            fi
+            echo "::error title=${ISSUE_TITLE}::${open}"
           }
-          echo "返回内容: $body"
-          off=$(printf '%s' "$body" | jq -c '.off // empty' 2>/dev/null || true)
-          if [ -n "$off" ] \
-             && printf '%s' "$off" | jq -e 'type=="array" and index("plushie")!=null and index("stickers")!=null' >/dev/null; then
-            echo "仍已领完"
+
+          if [ "${{ inputs.test_alert }}" = "true" ]; then
+            alert "（测试提醒，并非真实补货）"
             exit 0
           fi
-          open=""
-          printf '%s' "$off" | jq -e 'type=="array" and index("plushie")!=null' >/dev/null 2>&1 || open="$open 毛绒玩具(plushie)"
-          printf '%s' "$off" | jq -e 'type=="array" and index("stickers")!=null' >/dev/null 2>&1 || open="$open 贴纸(stickers)"
-          echo "::error title=Claude 周边可能补货了::开放项目:${open}。立刻用手机打开 https://claude.dev/terminal/ 输入 /plushies 或 /stickers 登记"
-          exit 1
+
+          end=$(( $(date +%s) + 350 * 60 ))
+          last_alert=0
+          restocked=0
+          while [ "$(date +%s)" -lt "$end" ]; do
+            body=$(curl -fsS -m 20 --retry 2 --retry-delay 5 -A "Mozilla/5.0 swag-watch" "$STATUS_URL" 2>/dev/null) || body=""
+            if [ -z "$body" ]; then
+              echo "$(date -u +%H:%M) 读取失败，本轮跳过"
+            else
+              off=$(printf '%s' "$body" | jq -c '.off // empty' 2>/dev/null || true)
+              open=""
+              printf '%s' "$off" | jq -e 'type=="array" and index("plushie")!=null' >/dev/null 2>&1 || open="$open 毛绒玩具(plushie)"
+              printf '%s' "$off" | jq -e 'type=="array" and index("stickers")!=null' >/dev/null 2>&1 || open="$open 贴纸(stickers)"
+              if [ -z "$open" ]; then
+                echo "$(date -u +%H:%M) 仍已领完"
+              else
+                echo "$(date -u +%H:%M) 可能补货:${open}，返回内容: $body"
+                restocked=1
+                now=$(date +%s)
+                if [ $(( now - last_alert )) -ge 1800 ]; then
+                  alert "$open"
+                  last_alert=$now
+                fi
+              fi
+            fi
+            sleep 300
+          done
+          echo "restocked=$restocked" >> "$GITHUB_OUTPUT"
+
+      - name: Start next round
+        if: always() && inputs.test_alert != true
+        run: gh workflow run swag-watch.yml --ref "${{ github.ref_name }}"
+
+      - name: Fail when restocked
+        if: steps.watch.outputs.restocked == '1'
+        run: exit 1
