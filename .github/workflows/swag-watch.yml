@@ -1,3 +1,4 @@
+# Claude 周边补货监控：每5分钟检查一次，补货时任务失败并触发 GitHub 邮件通知
 name: swag-watch
 
 on:
